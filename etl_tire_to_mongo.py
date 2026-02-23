@@ -24,7 +24,7 @@ def fetch_html():
     session = requests.Session()
     session.cookies.set("PHPSESSID", PHPSESSID)
 
-    r = session.get(URL, verify=certifi.where(), timeout=180)
+    r = session.get(URL, verify=False, timeout=180)
     r.raise_for_status()
 
     if "login" in r.text.lower():
