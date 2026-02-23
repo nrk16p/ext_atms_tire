@@ -4,7 +4,8 @@ import traceback
 import requests
 import pandas as pd
 import certifi
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, UpdateOne , ReplaceOne
+
 from datetime import datetime
 from io import StringIO
 
@@ -81,7 +82,7 @@ def upsert_mongo(df):
     client = MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION_NAME]
 
-    # Composite index
+    # Composite index (กัน duplicate)
     collection.create_index(
         [
             ("receipt_no", 1),
@@ -92,54 +93,39 @@ def upsert_mongo(df):
     )
 
     operations = []
-    total_modified = 0
-    total_upserted = 0
 
     for _, row in df.iterrows():
         record = row.to_dict()
 
-        # composite key validation
         receipt_no = record.get("receipt_no")
         truck_no = record.get("truck_no")
         garage_entry_at = record.get("garage_entry_at")
 
+        # skip row ถ้า key ไม่ครบ
         if not all([receipt_no, truck_no, garage_entry_at]):
             continue
 
         operations.append(
-            UpdateOne(
+            ReplaceOne(
                 {
                     "receipt_no": receipt_no,
                     "truck_no": truck_no,
                     "garage_entry_at": garage_entry_at,
                 },
-                {"$set": record},
+                record,
                 upsert=True
             )
         )
-
-        if len(operations) >= BATCH_SIZE:
-            result = collection.bulk_write(
-                operations,
-                ordered=False
-            )
-            total_modified += result.modified_count
-            total_upserted += result.upserted_count
-            operations = []
 
     if operations:
         result = collection.bulk_write(
             operations,
             ordered=False
         )
-        total_modified += result.modified_count
-        total_upserted += result.upserted_count
+        print("Matched:", result.matched_count)
+        print("Upserted:", result.upserted_count)
 
     client.close()
-
-    print("Modified:", total_modified)
-    print("Upserted:", total_upserted)
-
 
 # ==========================================
 # MAIN
