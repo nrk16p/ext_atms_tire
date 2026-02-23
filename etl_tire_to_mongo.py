@@ -4,57 +4,39 @@ import traceback
 import requests
 import pandas as pd
 import certifi
-from pymongo import MongoClient, UpdateOne , ReplaceOne
-
+import time
+from pymongo import MongoClient, ReplaceOne
 from datetime import datetime
 from io import StringIO
 
-# ==========================================
-# CONFIG FROM ENV (JENKINS SAFE)
-# ==========================================
 URL = os.getenv("TIRE_EXPORT_URL")
 PHPSESSID = os.getenv("MENA_SESSION")
 MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
 COLLECTION_NAME = "tire"
-BATCH_SIZE = 1000
+
+BATCH_SIZE = 500   # 🔥 small batch to reduce spike
+SLEEP_SEC = 0.05   # 🔥 small delay to smooth CPU
 
 
-# ==========================================
-# FETCH HTML
-# ==========================================
 def fetch_html():
     session = requests.Session()
     session.cookies.set("PHPSESSID", PHPSESSID)
 
-    response = session.get(
-        URL,
-        verify=False,
-        timeout=60
-    )
-    response.raise_for_status()
+    r = session.get(URL, verify=certifi.where(), timeout=180)
+    r.raise_for_status()
 
-    # detect login redirect
-    if "login" in response.text.lower():
-        raise Exception("Session expired or redirected to login page")
+    if "login" in r.text.lower():
+        raise Exception("Session expired")
 
-    response.encoding = "utf-8"
-    return response.text
+    r.encoding = "utf-8"
+    return r.text
 
 
-# ==========================================
-# PARSE TABLE
-# ==========================================
 def parse_table(html):
-    tables = pd.read_html(StringIO(html), flavor="lxml")
+    df = pd.read_html(StringIO(html), flavor="lxml")[0]
 
-    if not tables:
-        raise Exception("No table found in HTML")
-
-    df = tables[0]
-
-    # normalize column names
     df.columns = (
         df.columns
         .str.strip()
@@ -63,101 +45,86 @@ def parse_table(html):
     )
 
     df = df.dropna(how="all")
-
     df["etl_loaded_at"] = datetime.utcnow()
-
-    # convert date column safely
-    if "เปลี่ยนเข้า" in df.columns:
-        df["เปลี่ยนเข้า"] = pd.to_datetime(
-            df["เปลี่ยนเข้า"], errors="coerce"
-        )
 
     return df
 
 
-# ==========================================
-# UPSERT TO MONGO
-# ==========================================
-def upsert_mongo(df):
-    client = MongoClient(MONGO_URI)
-    collection = client[DB_NAME][COLLECTION_NAME]
+def upsert_stream(df):
 
-    # Composite index (กัน duplicate)
-    collection.create_index(
-        [
-            ("receipt_no", 1),
-            ("truck_no", 1),
-            ("garage_entry_at", 1),
-        ],
-        name="uniq_tire_composite"
+    client = MongoClient(
+        MONGO_URI,
+        maxPoolSize=20,
+        socketTimeoutMS=600000
     )
 
-    operations = []
+    col = client[DB_NAME][COLLECTION_NAME]
 
-    for _, row in df.iterrows():
-        record = row.to_dict()
+    total = len(df)
+    print("Total rows:", total)
 
-        receipt_no = record.get("receipt_no")
-        truck_no = record.get("truck_no")
-        garage_entry_at = record.get("garage_entry_at")
+    for start in range(0, total, BATCH_SIZE):
 
-        # skip row ถ้า key ไม่ครบ
-        if not all([receipt_no, truck_no, garage_entry_at]):
-            continue
+        chunk_df = df.iloc[start:start+BATCH_SIZE]
 
-        operations.append(
-            ReplaceOne(
-                {
-                    "receipt_no": receipt_no,
-                    "truck_no": truck_no,
-                    "garage_entry_at": garage_entry_at,
-                },
-                record,
-                upsert=True
+        ops = []
+
+        for r in chunk_df.to_dict("records"):
+
+            receipt_no = r.get("receipt_no")
+            truck_no = r.get("truck_no")
+            garage_entry_at = r.get("garage_entry_at")
+
+            if not (receipt_no and truck_no and garage_entry_at):
+                continue
+
+            ops.append(
+                ReplaceOne(
+                    {
+                        "receipt_no": receipt_no,
+                        "truck_no": truck_no,
+                        "garage_entry_at": garage_entry_at,
+                    },
+                    r,
+                    upsert=True
+                )
             )
-        )
 
-    if operations:
-        result = collection.bulk_write(
-            operations,
-            ordered=False
-        )
-        print("Matched:", result.matched_count)
-        print("Upserted:", result.upserted_count)
+        if ops:
+            col.bulk_write(ops, ordered=False)
+
+        print(f"Processed {min(start+BATCH_SIZE, total)} / {total}")
+
+        time.sleep(SLEEP_SEC)   # 🔥 smooth CPU usage
 
     client.close()
 
-# ==========================================
-# MAIN
-# ==========================================
-def main():
-    if not all([URL, PHPSESSID, MONGO_URI]):
-        raise Exception("Missing environment variables")
 
-    print("🚀 Start ETL:", datetime.utcnow())
+def main():
+
+    if not all([URL, PHPSESSID, MONGO_URI]):
+        raise Exception("Missing ENV")
+
+    start_time = datetime.utcnow()
+    print("🚀 Start:", start_time)
 
     html = fetch_html()
     df = parse_table(html)
 
-    print("Rows fetched:", len(df))
-
     if df.empty:
-        print("⚠️ DataFrame empty. Exit safely.")
+        print("Empty data")
         return
 
-    upsert_mongo(df)
+    upsert_stream(df)
 
-    print("✅ ETL Completed Successfully")
+    print("✅ Done in", datetime.utcnow() - start_time)
 
 
-# ==========================================
-# ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
     try:
         main()
         sys.exit(0)
     except Exception as e:
-        print("❌ ETL FAILED:", str(e))
+        print("❌ FAILED:", str(e))
         traceback.print_exc()
         sys.exit(1)
