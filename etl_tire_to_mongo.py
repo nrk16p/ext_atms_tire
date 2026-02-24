@@ -205,8 +205,11 @@ def main():
     df = map_columns(df)
     df = parse_dates(df)
 
-    # 🔥 YOUR REQUESTED LINE
+    # 🔥 Remove rows with invalid key
     df = df[df["garage_entry_at"].notna()]
+
+    # 🔥 Convert ALL remaining NaT/NaN → None (critical fix)
+    df = df.where(pd.notnull(df), None)
 
     df = df.drop_duplicates(
         subset=["receipt_no", "truck_no", "garage_entry_at"],
