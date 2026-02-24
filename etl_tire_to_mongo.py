@@ -1,29 +1,29 @@
 import os
 import sys
-import time
 import traceback
 import requests
+import pandas as pd
 import urllib3
 
-from bs4 import BeautifulSoup
 from pymongo import MongoClient, InsertOne
 from datetime import datetime, timezone
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# ENV CONFIG
+# CONFIG
 # ==========================================
-URL_TEMPLATE = os.getenv("TIRE_EXPORT_URL_TEMPLATE")
+URL = os.getenv("TIRE_EXPORT_URL")
 PHPSESSID = os.getenv("MENA_SESSION")
 MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
 COLLECTION_NAME = "tire_raw"
 BATCH_SIZE = 1000
-REQUEST_TIMEOUT = 60
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 
 # ==========================================
@@ -33,55 +33,55 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
-def fetch_html(url):
+def main():
+
+    if not all([URL, PHPSESSID, MONGO_URI]):
+        raise Exception("Missing env variables: TIRE_EXPORT_URL, MENA_SESSION, MONGO_URI")
+
+    print("🚀 Start ETL:", utcnow())
+
     session = requests.Session()
     session.cookies.set("PHPSESSID", PHPSESSID)
 
-    r = session.get(url, headers=HEADERS, verify=False, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    response = session.get(URL, headers=HEADERS, verify=False)
+    response.raise_for_status()
 
+    print("Status:", response.status_code)
+    print("Content-Type:", response.headers.get("Content-Type"))
 
-def parse_table(html):
-    soup = BeautifulSoup(html, "lxml")
+    # ==========================================
+    # READ FULL TABLE
+    # ==========================================
+    tables = pd.read_html(response.text)
 
-    table = soup.find("table")
-    if not table:
-        return []
+    print("Total tables found:", len(tables))
 
-    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    if not tables:
+        raise Exception("No table found in export response")
 
-    rows = []
-    for tr in table.find_all("tr"):
-        cells = tr.find_all("td")
-        if not cells:
-            continue
+    df = tables[0]
 
-        values = [c.get_text(strip=True) for c in cells]
+    print("Rows fetched:", len(df))
 
-        if len(values) == len(headers):
-            row_dict = dict(zip(headers, values))
-            rows.append(row_dict)
+    # ==========================================
+    # CONVERT EVERYTHING TO STRING
+    # ==========================================
+    df = df.astype(str)
 
-    return rows
+    records = df.to_dict(orient="records")
 
-
-# ==========================================
-# MONGO INSERT (RAW)
-# ==========================================
-def insert_all_to_mongo(rows):
-
+    # ==========================================
+    # SEND TO MONGO
+    # ==========================================
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
 
     ops = []
     total = 0
 
-    for r in rows:
-        record = r.copy()
-        record["etl_loaded_at"] = utcnow()
-
-        ops.append(InsertOne(record))
+    for r in records:
+        r["etl_loaded_at"] = utcnow()
+        ops.append(InsertOne(r))
         total += 1
 
         if len(ops) >= BATCH_SIZE:
@@ -94,42 +94,7 @@ def insert_all_to_mongo(rows):
     client.close()
 
     print("🔥 Sent to Mongo:", total)
-
-
-# ==========================================
-# MAIN
-# ==========================================
-def main():
-
-    if not all([URL_TEMPLATE, PHPSESSID, MONGO_URI]):
-        raise Exception(
-            "Missing environment variables: "
-            "TIRE_EXPORT_URL_TEMPLATE, MENA_SESSION, MONGO_URI"
-        )
-
-    print("🚀 Start ETL:", utcnow())
-
-    all_rows = []
-
-    # iterate pages
-    for page in range(1, 200):  # increase if needed
-        url = URL_TEMPLATE.format(page=page)
-        html = fetch_html(url)
-        rows = parse_table(html)
-
-        if not rows:
-            break
-
-        print(f"Page {page}: {len(rows)} rows")
-        all_rows.extend(rows)
-
-    print("Total rows collected:", len(all_rows))
-
-    if all_rows:
-        insert_all_to_mongo(all_rows)
-        print("✅ Completed successfully")
-    else:
-        print("⚠️ No rows found")
+    print("✅ ETL Completed Successfully")
 
 
 if __name__ == "__main__":
