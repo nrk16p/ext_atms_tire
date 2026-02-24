@@ -6,7 +6,7 @@ import requests
 import urllib3
 
 from bs4 import BeautifulSoup
-from pymongo import MongoClient, ReplaceOne
+from pymongo import MongoClient, InsertOne
 from datetime import datetime, timezone
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -19,7 +19,7 @@ PHPSESSID = os.getenv("MENA_SESSION")
 MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
-COLLECTION_NAME = "tire"
+COLLECTION_NAME = "tire_raw"
 BATCH_SIZE = 1000
 REQUEST_TIMEOUT = 60
 
@@ -60,55 +60,28 @@ def parse_table(html):
         values = [c.get_text(strip=True) for c in cells]
 
         if len(values) == len(headers):
-            rows.append(dict(zip(headers, values)))
+            row_dict = dict(zip(headers, values))
+            rows.append(row_dict)
 
     return rows
 
 
 # ==========================================
-# MONGO UPSERT
+# MONGO INSERT (RAW)
 # ==========================================
-def upsert_mongo(rows):
+def insert_all_to_mongo(rows):
 
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
-
-    col.create_index(
-        [("receipt_no", 1), ("truck_no", 1), ("garage_entry_at", 1)],
-        name="uniq_tire_composite",
-        background=True,
-    )
 
     ops = []
     total = 0
 
     for r in rows:
-
-        receipt = r.get("แจ้งซ่อม_/_ขอเปลี่ยนยาง", "")
-        truck = r.get("ยานพาหนะ", "")
-        entry = r.get("เปลี่ยนเข้า", "")
-
-        if not receipt or not truck or not entry:
-            continue
-
         record = r.copy()
-        record["receipt_no"] = receipt
-        record["truck_no"] = truck
-        record["garage_entry_at"] = entry
         record["etl_loaded_at"] = utcnow()
 
-        ops.append(
-            ReplaceOne(
-                {
-                    "receipt_no": receipt,
-                    "truck_no": truck,
-                    "garage_entry_at": entry,
-                },
-                record,
-                upsert=True,
-            )
-        )
-
+        ops.append(InsertOne(record))
         total += 1
 
         if len(ops) >= BATCH_SIZE:
@@ -119,6 +92,7 @@ def upsert_mongo(rows):
         col.bulk_write(ops, ordered=False)
 
     client.close()
+
     print("🔥 Sent to Mongo:", total)
 
 
@@ -138,7 +112,7 @@ def main():
     all_rows = []
 
     # iterate pages
-    for page in range(1, 200):  # adjust max pages if needed
+    for page in range(1, 200):  # increase if needed
         url = URL_TEMPLATE.format(page=page)
         html = fetch_html(url)
         rows = parse_table(html)
@@ -152,7 +126,7 @@ def main():
     print("Total rows collected:", len(all_rows))
 
     if all_rows:
-        upsert_mongo(all_rows)
+        insert_all_to_mongo(all_rows)
         print("✅ Completed successfully")
     else:
         print("⚠️ No rows found")
