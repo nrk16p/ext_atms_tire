@@ -17,9 +17,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
 COLLECTION_NAME = "tire_raw"
-BATCH_SIZE = 1000
-
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+BATCH_SIZE = 500   # 🔥 lower = smoother CPU
 
 
 def utcnow():
@@ -33,50 +31,54 @@ def main():
     session = requests.Session()
     session.cookies.set("PHPSESSID", PHPSESSID)
 
-    response = session.get(URL, headers=HEADERS, verify=False)
+    response = session.get(URL, verify=False)
     response.raise_for_status()
 
     print("Status:", response.status_code)
-    print("Content-Type:", response.headers.get("Content-Type"))
 
-    # 🔥 IMPORTANT FIX
-    tables = pd.read_html(StringIO(response.text))
-
-    print("Tables found:", len(tables))
+    # 🔥 Read with pandas (optimized)
+    tables = pd.read_html(
+        StringIO(response.text),
+        flavor="lxml",
+        thousands=None
+    )
 
     if not tables:
         raise Exception("No table found")
 
     df = tables[0]
+    df = df.astype("string")
 
     print("Rows fetched:", len(df))
-
-    # convert everything to string
-    df = df.astype(str)
-
-    records = df.to_dict("records")
 
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
 
-    ops = []
-    total = 0
+    total_sent = 0
 
-    for r in records:
-        r["etl_loaded_at"] = utcnow()
-        ops.append(InsertOne(r))
-        total += 1
+    # 🔥 Process in DataFrame batches
+    for start in range(0, len(df), BATCH_SIZE):
 
-        if len(ops) >= BATCH_SIZE:
+        end = start + BATCH_SIZE
+        df_batch = df.iloc[start:end]
+
+        records = df_batch.to_dict("records")
+
+        ops = []
+
+        for r in records:
+            r["etl_loaded_at"] = utcnow()
+            ops.append(InsertOne(r))
+
+        if ops:
             col.bulk_write(ops, ordered=False)
-            ops = []
+            total_sent += len(ops)
 
-    if ops:
-        col.bulk_write(ops, ordered=False)
+        print(f"Sent batch {start} - {end}")
 
     client.close()
 
-    print("🔥 Sent to Mongo:", total)
+    print("🔥 Total Sent:", total_sent)
     print("✅ Completed Successfully")
 
 
