@@ -4,9 +4,14 @@ import time
 import traceback
 import requests
 import pandas as pd
+import urllib3
+
 from pymongo import MongoClient, ReplaceOne
 from datetime import datetime, timezone
 from io import StringIO
+
+# Silence HTTPS warning (because verify=False)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
 # CONFIG FROM ENV (JENKINS SAFE)
@@ -75,27 +80,6 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def clean_for_mongo(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert NaT/NaN to None
-    Convert pandas Timestamp to python datetime
-    """
-    df = df.copy()
-
-    # Replace NaN / NaT globally
-    df = df.where(pd.notnull(df), None)
-
-    datetime_cols = ["garage_entry_at", "garage_exit_at", "updated_at"]
-
-    for c in datetime_cols:
-        if c in df.columns:
-            df[c] = df[c].apply(
-                lambda x: x.to_pydatetime() if isinstance(x, pd.Timestamp) else x
-            )
-
-    return df
-
-
 # ==========================================
 # FETCH HTML
 # ==========================================
@@ -135,8 +119,6 @@ def extract_first_table(html: str) -> pd.DataFrame:
 # MONGO UPSERT
 # ==========================================
 def upsert_mongo(df: pd.DataFrame):
-    if not MONGO_URI:
-        raise Exception("Missing MONGO_URI")
 
     client = MongoClient(
         MONGO_URI,
@@ -153,7 +135,6 @@ def upsert_mongo(df: pd.DataFrame):
     )
 
     total_rows = len(df)
-    skipped = 0
     sent_ops = 0
     matched = 0
     modified = 0
@@ -164,23 +145,14 @@ def upsert_mongo(df: pd.DataFrame):
 
     for _, row in df.iterrows():
         record = row.to_dict()
-
-        receipt_no = record.get("receipt_no")
-        truck_no = record.get("truck_no")
-        garage_entry_at = record.get("garage_entry_at")
-
-        if receipt_no is None or truck_no is None or garage_entry_at is None:
-            skipped += 1
-            continue
-
         record["etl_loaded_at"] = utcnow()
 
         ops.append(
             ReplaceOne(
                 {
-                    "receipt_no": receipt_no,
-                    "truck_no": truck_no,
-                    "garage_entry_at": garage_entry_at,
+                    "receipt_no": record["receipt_no"],
+                    "truck_no": record["truck_no"],
+                    "garage_entry_at": record["garage_entry_at"],
                 },
                 record,
                 upsert=True,
@@ -206,12 +178,11 @@ def upsert_mongo(df: pd.DataFrame):
     client.close()
 
     print("---- MONGO RESULT ----")
-    print("Total rows in df:", total_rows)
+    print("Total rows:", total_rows)
     print("Ops sent:", sent_ops)
-    print("Skipped (missing key):", skipped)
     print("Matched:", matched)
     print("Modified:", modified)
-    print("Upserted (new inserts):", upserted)
+    print("Upserted:", upserted)
     print(f"Elapsed: {elapsed:.2f}s")
 
 
@@ -219,6 +190,7 @@ def upsert_mongo(df: pd.DataFrame):
 # MAIN
 # ==========================================
 def main():
+
     if not all([URL, PHPSESSID, MONGO_URI]):
         raise Exception("Missing environment variables")
 
@@ -226,19 +198,15 @@ def main():
 
     html = fetch_html()
     df = extract_first_table(html)
+
     print("Rows fetched:", len(df))
 
     df = normalize_cols(df)
     df = map_columns(df)
     df = parse_dates(df)
-    df = clean_for_mongo(df)
 
-    must_cols = ["receipt_no", "truck_no", "garage_entry_at"]
-    for c in must_cols:
-        if c not in df.columns:
-            raise Exception(
-                f"Missing required column after mapping: {c}. Current cols: {list(df.columns)[:20]}"
-            )
+    # 🔥 YOUR REQUESTED LINE
+    df = df[df["garage_entry_at"].notna()]
 
     df = df.drop_duplicates(
         subset=["receipt_no", "truck_no", "garage_entry_at"],
