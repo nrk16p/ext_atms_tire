@@ -54,14 +54,12 @@ def main():
     # ==========================================
     tables = pd.read_html(response.text)
 
-    print("Total tables found:", len(tables))
 
     if not tables:
         raise Exception("No table found in export response")
 
     df = tables[0]
 
-    print("Rows fetched:", len(df))
 
     # ==========================================
     # CONVERT EVERYTHING TO STRING
