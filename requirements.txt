@@ -3,3 +3,4 @@ pandas
 pymongo
 certifi
 lxml
+beautifulsoup4
