@@ -7,12 +7,10 @@ import urllib3
 
 from pymongo import MongoClient, InsertOne
 from datetime import datetime, timezone
+from io import StringIO
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==========================================
-# CONFIG
-# ==========================================
 URL = os.getenv("TIRE_EXPORT_URL")
 PHPSESSID = os.getenv("MENA_SESSION")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -21,22 +19,14 @@ DB_NAME = "atms"
 COLLECTION_NAME = "tire_raw"
 BATCH_SIZE = 1000
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
-# ==========================================
-# HELPERS
-# ==========================================
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
 def main():
-
-    if not all([URL, PHPSESSID, MONGO_URI]):
-        raise Exception("Missing env variables: TIRE_EXPORT_URL, MENA_SESSION, MONGO_URI")
 
     print("🚀 Start ETL:", utcnow())
 
@@ -49,28 +39,23 @@ def main():
     print("Status:", response.status_code)
     print("Content-Type:", response.headers.get("Content-Type"))
 
-    # ==========================================
-    # READ FULL TABLE
-    # ==========================================
-    tables = pd.read_html(response.text)
+    # 🔥 IMPORTANT FIX
+    tables = pd.read_html(StringIO(response.text))
 
+    print("Tables found:", len(tables))
 
     if not tables:
-        raise Exception("No table found in export response")
+        raise Exception("No table found")
 
     df = tables[0]
 
+    print("Rows fetched:", len(df))
 
-    # ==========================================
-    # CONVERT EVERYTHING TO STRING
-    # ==========================================
+    # convert everything to string
     df = df.astype(str)
 
-    records = df.to_dict(orient="records")
+    records = df.to_dict("records")
 
-    # ==========================================
-    # SEND TO MONGO
-    # ==========================================
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
 
@@ -92,7 +77,7 @@ def main():
     client.close()
 
     print("🔥 Sent to Mongo:", total)
-    print("✅ ETL Completed Successfully")
+    print("✅ Completed Successfully")
 
 
 if __name__ == "__main__":
