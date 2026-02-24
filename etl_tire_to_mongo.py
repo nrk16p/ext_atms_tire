@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 import urllib3
 
-from pymongo import MongoClient, InsertOne
+from pymongo import MongoClient, ReplaceOne
 from datetime import datetime, timezone
 from io import StringIO
 
@@ -17,7 +17,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
 COLLECTION_NAME = "tire_raw"
-BATCH_SIZE = 500   # 🔥 lower = smoother CPU
+BATCH_SIZE = 500
 
 
 def utcnow():
@@ -34,9 +34,6 @@ def main():
     response = session.get(URL, verify=False)
     response.raise_for_status()
 
-    print("Status:", response.status_code)
-
-    # 🔥 Read with pandas (optimized)
     tables = pd.read_html(
         StringIO(response.text),
         flavor="lxml",
@@ -46,39 +43,56 @@ def main():
     if not tables:
         raise Exception("No table found")
 
-    df = tables[0]
-    df = df.astype("string")
+    df = tables[0].astype("string")
 
     print("Rows fetched:", len(df))
 
     client = MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION_NAME]
 
+    # 🔥 Create unique index once
+    col.create_index(
+        [
+            ("ยานพาหนะ", 1),
+            ("serial no", 1),
+            ("แจ้งซ่อม / ขอเปลี่ยนยาง", 1)
+        ],
+        unique=True,
+        background=True
+    )
+
     total_sent = 0
 
-    # 🔥 Process in DataFrame batches
     for start in range(0, len(df), BATCH_SIZE):
 
-        end = start + BATCH_SIZE
-        df_batch = df.iloc[start:end]
-
+        df_batch = df.iloc[start:start + BATCH_SIZE]
         records = df_batch.to_dict("records")
 
         ops = []
 
         for r in records:
+
             r["etl_loaded_at"] = utcnow()
-            ops.append(InsertOne(r))
+
+            filter_query = {
+                "ยานพาหนะ": r.get("ยานพาหนะ"),
+                "serial no": r.get("serial no"),
+                "แจ้งซ่อม / ขอเปลี่ยนยาง": r.get("แจ้งซ่อม / ขอเปลี่ยนยาง")
+            }
+
+            ops.append(
+                ReplaceOne(filter_query, r, upsert=True)
+            )
 
         if ops:
             col.bulk_write(ops, ordered=False)
             total_sent += len(ops)
 
-        print(f"Sent batch {start} - {end}")
+        print(f"Processed batch {start}")
 
     client.close()
 
-    print("🔥 Total Sent:", total_sent)
+    print("🔥 Upserted:", total_sent)
     print("✅ Completed Successfully")
 
 
