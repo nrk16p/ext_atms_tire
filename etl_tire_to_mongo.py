@@ -17,14 +17,16 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 DB_NAME = "atms"
 COLLECTION_NAME = "tire"
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))  # tune ได้ 500/1000/2000
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 REQUEST_TIMEOUT = 60
+
 
 # ==========================================
 # HELPERS
 # ==========================================
 def utcnow():
     return datetime.now(timezone.utc)
+
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -36,27 +38,18 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+
 def map_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Map Thai headers -> canonical English fields used for keys.
-    Adjust mapping if your source columns differ.
-    """
     df = df.copy()
 
-    # After normalize_cols(), Thai headers still Thai, but lower+underscored.
-    # From your HTML:
-    # "ยานพาหนะ" -> vehicle
-    # "แจ้งซ่อม_/_ขอเปลี่ยนยาง" -> receipt_no (or repair_request_code)
-    # "เปลี่ยนเข้า" -> garage_entry_at
-    # Optional: add more fields
     colmap = {
-        "ยานพาหนะ": "vehicle",  # e.g. ทะเบียน
-        "แจ้งซ่อม_/_ขอเปลี่ยนยาง": "receipt_no",  # e.g. LBMR25110289
+        "ยานพาหนะ": "vehicle",
+        "แจ้งซ่อม_/_ขอเปลี่ยนยาง": "receipt_no",
         "เปลี่ยนเข้า": "garage_entry_at",
         "เปลี่ยนออก": "garage_exit_at",
         "ตำแหน่งยาง": "tire_position",
         "สินค้า": "sku_name",
-        "serial_no": "serial_no",  # if it comes as serial no already
+        "serial_no": "serial_no",
         "มม.": "millimeter",
         "เลขไมล์เริ่มต้น": "mile_in",
         "เลขไมล์สิ้นสุด": "mile_out",
@@ -65,17 +58,14 @@ def map_columns(df: pd.DataFrame) -> pd.DataFrame:
         "แก้ไขเมื่อ": "updated_at",
     }
 
-    # rename only columns that exist
     rename_dict = {c: colmap[c] for c in df.columns if c in colmap}
     df = df.rename(columns=rename_dict)
 
-    # Derive truck_no if you want it separate (optional)
-    # If your "vehicle" is plate and you also have "เบอร์รถ" somewhere, map it too.
-    # For now set truck_no = vehicle to keep composite key complete.
     if "truck_no" not in df.columns:
         df["truck_no"] = df.get("vehicle")
 
     return df
+
 
 def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -83,6 +73,28 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
     return df
+
+
+def clean_for_mongo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert NaT/NaN to None
+    Convert pandas Timestamp to python datetime
+    """
+    df = df.copy()
+
+    # Replace NaN / NaT globally
+    df = df.where(pd.notnull(df), None)
+
+    datetime_cols = ["garage_entry_at", "garage_exit_at", "updated_at"]
+
+    for c in datetime_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(
+                lambda x: x.to_pydatetime() if isinstance(x, pd.Timestamp) else x
+            )
+
+    return df
+
 
 # ==========================================
 # FETCH HTML
@@ -96,38 +108,44 @@ def fetch_html():
 
     r = session.get(URL, verify=False, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-    text = r.text
 
-    # basic guard: session expired/login page
+    text = r.text
     low = text.lower()
-    if "login" in low or "phpsessid" in low and "password" in low:
+
+    if "login" in low or ("password" in low and "phpsessid" in low):
         raise Exception("Session expired / redirected to login page")
 
     return text
+
 
 # ==========================================
 # PARSE TABLE
 # ==========================================
 def extract_first_table(html: str) -> pd.DataFrame:
-    # IMPORTANT: use StringIO to avoid pandas treating html as file path
     tables = pd.read_html(StringIO(html), flavor="lxml")
     if not tables:
         raise Exception("No table found in HTML")
+
     df = tables[0]
     df = df.dropna(how="all")
     return df
 
+
 # ==========================================
-# MONGO UPSERT (ReplaceOne) - BATCHED
+# MONGO UPSERT
 # ==========================================
 def upsert_mongo(df: pd.DataFrame):
     if not MONGO_URI:
         raise Exception("Missing MONGO_URI")
 
-    client = MongoClient(MONGO_URI, connectTimeoutMS=20000, serverSelectionTimeoutMS=20000)
+    client = MongoClient(
+        MONGO_URI,
+        connectTimeoutMS=20000,
+        serverSelectionTimeoutMS=20000,
+    )
+
     col = client[DB_NAME][COLLECTION_NAME]
 
-    # Unique composite index (must match the filter used in ReplaceOne)
     col.create_index(
         [("receipt_no", 1), ("truck_no", 1), ("garage_entry_at", 1)],
         name="uniq_tire_composite",
@@ -138,8 +156,8 @@ def upsert_mongo(df: pd.DataFrame):
     skipped = 0
     sent_ops = 0
     matched = 0
-    upserted = 0
     modified = 0
+    upserted = 0
 
     ops = []
     start = time.time()
@@ -151,17 +169,19 @@ def upsert_mongo(df: pd.DataFrame):
         truck_no = record.get("truck_no")
         garage_entry_at = record.get("garage_entry_at")
 
-        # key validation
-        if pd.isna(receipt_no) or pd.isna(truck_no) or pd.isna(garage_entry_at):
+        if receipt_no is None or truck_no is None or garage_entry_at is None:
             skipped += 1
             continue
 
-        # add ETL metadata
         record["etl_loaded_at"] = utcnow()
 
         ops.append(
             ReplaceOne(
-                {"receipt_no": receipt_no, "truck_no": truck_no, "garage_entry_at": garage_entry_at},
+                {
+                    "receipt_no": receipt_no,
+                    "truck_no": truck_no,
+                    "garage_entry_at": garage_entry_at,
+                },
                 record,
                 upsert=True,
             )
@@ -194,12 +214,13 @@ def upsert_mongo(df: pd.DataFrame):
     print("Upserted (new inserts):", upserted)
     print(f"Elapsed: {elapsed:.2f}s")
 
+
 # ==========================================
 # MAIN
 # ==========================================
 def main():
     if not all([URL, PHPSESSID, MONGO_URI]):
-        raise Exception("Missing environment variables: TIRE_EXPORT_URL / MENA_SESSION / MONGO_URI")
+        raise Exception("Missing environment variables")
 
     print("🚀 Start ETL:", utcnow().isoformat())
 
@@ -210,19 +231,24 @@ def main():
     df = normalize_cols(df)
     df = map_columns(df)
     df = parse_dates(df)
+    df = clean_for_mongo(df)
 
-    # Quick sanity checks before write
     must_cols = ["receipt_no", "truck_no", "garage_entry_at"]
     for c in must_cols:
         if c not in df.columns:
-            raise Exception(f"Missing required column after mapping: {c}. Current cols: {list(df.columns)[:30]}...")
+            raise Exception(
+                f"Missing required column after mapping: {c}. Current cols: {list(df.columns)[:20]}"
+            )
 
-    # Optional: drop duplicates by key to reduce mongo workload
-    df = df.drop_duplicates(subset=["receipt_no", "truck_no", "garage_entry_at"], keep="last")
+    df = df.drop_duplicates(
+        subset=["receipt_no", "truck_no", "garage_entry_at"],
+        keep="last",
+    )
 
     upsert_mongo(df)
 
     print("✅ ETL Completed Successfully")
+
 
 if __name__ == "__main__":
     try:
